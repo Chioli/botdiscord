@@ -1,11 +1,11 @@
 import os
 import re
+import asyncio
 import logging
 import threading
-import asyncio
-from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
+from urllib.parse import urlparse, urlencode, urlunparse
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import nextcord as discord
+import aiohttp
 
 # ── Configurações ────────────────────────────────────────────────────────────
 TOKEN = os.environ.get("DISCORD_TOKEN")
@@ -16,42 +16,39 @@ if not TOKEN:
     raise ValueError("Configure DISCORD_TOKEN nas variáveis de ambiente!")
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 
-# ── Servidor HTTP (keep alive para Render gratuito) ──────────────────────────
+DISCORD_API = "https://discord.com/api/v10"
+
+# ── Servidor HTTP (keep alive Render) ────────────────────────────────────────
 class KeepAlive(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
         self.wfile.write(b"Bot rodando!")
-
     def do_HEAD(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
-
     def do_POST(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
         self.wfile.write(b"ok")
-
     def log_message(self, format, *args):
         pass
 
 def iniciar_servidor():
-    server = HTTPServer(("0.0.0.0", PORT), KeepAlive)
-    server.serve_forever()
+    HTTPServer(("0.0.0.0", PORT), KeepAlive).serve_forever()
 
 # ── Funções de link ──────────────────────────────────────────────────────────
 DOMINIOS_ML = [
     "mercadolivre.com.br",
     "mercadolibre.com",
     "ml.com.br",
-    "mlm.net.br",
     "produto.mercadolivre.com.br",
 ]
 
@@ -70,55 +67,105 @@ def adicionar_afiliado(url: str, afiliado_id: str) -> str:
     except Exception:
         return url
 
-def extrair_e_converter_links(texto: str, afiliado_id: str):
+def converter_links(texto: str, afiliado_id: str):
     regex = r"https?://[^\s<>\"']+"
-    links_encontrados = re.findall(regex, texto)
+    links = re.findall(regex, texto)
     texto_final = texto
-    links_convertidos = []
-    for link in links_encontrados:
+    convertidos = []
+    for link in links:
         if eh_link_ml(link):
-            novo_link = adicionar_afiliado(link, afiliado_id)
-            texto_final = texto_final.replace(link, novo_link)
-            links_convertidos.append((link, novo_link))
-    return texto_final, links_convertidos
+            novo = adicionar_afiliado(link, afiliado_id)
+            texto_final = texto_final.replace(link, novo)
+            convertidos.append(novo)
+    return texto_final, convertidos
 
-# ── Bot Discord ──────────────────────────────────────────────────────────────
-intents = discord.Intents.default()
-intents.message_content = True
+# ── Gateway Discord via aiohttp puro ─────────────────────────────────────────
+async def enviar_mensagem(session, channel_id, conteudo):
+    url = f"{DISCORD_API}/channels/{channel_id}/messages"
+    headers = {"Authorization": f"Bot {TOKEN}", "Content-Type": "application/json"}
+    payload = {"content": conteudo}
+    async with session.post(url, json=payload, headers=headers) as r:
+        if r.status not in (200, 201):
+            logging.error(f"Erro ao enviar mensagem: {r.status}")
 
-client = discord.Client(intents=intents)
+async def conectar_gateway():
+    headers = {"Authorization": f"Bot {TOKEN}"}
+    async with aiohttp.ClientSession() as session:
+        # Pegar URL do gateway
+        async with session.get(f"{DISCORD_API}/gateway", headers=headers) as r:
+            data = await r.json()
+            gateway_url = data["url"] + "?v=10&encoding=json"
 
-@client.event
-async def on_ready():
-    print(f"✅ Bot conectado como {client.user}")
+        logging.info(f"Conectando ao gateway: {gateway_url}")
 
-@client.event
-async def on_message(message):
-    # Ignora mensagens do próprio bot
-    if message.author == client.user:
-        return
+        async with session.ws_connect(gateway_url) as ws:
+            heartbeat_interval = None
+            sequence = None
 
-    texto = message.content
-    if not texto.strip():
-        return
+            async def heartbeat():
+                while True:
+                    await asyncio.sleep(heartbeat_interval / 1000)
+                    await ws.send_json({"op": 1, "d": sequence})
 
-    texto_convertido, links = extrair_e_converter_links(texto, AFILIADO_ID)
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    data = msg.json()
+                    op = data.get("op")
+                    t = data.get("t")
 
-    if not links:
-        return  # Ignora mensagens sem link do ML
+                    if data.get("s"):
+                        sequence = data["s"]
 
-    qtd = len(links)
-    plural = "link convertido" if qtd == 1 else "links convertidos"
+                    # Hello — iniciar heartbeat e identificar
+                    if op == 10:
+                        heartbeat_interval = data["d"]["heartbeat_interval"]
+                        asyncio.create_task(heartbeat())
+                        await ws.send_json({
+                            "op": 2,
+                            "d": {
+                                "token": TOKEN,
+                                "intents": 33280,  # GUILDS + GUILD_MESSAGES + MESSAGE_CONTENT
+                                "properties": {
+                                    "os": "linux",
+                                    "browser": "bot",
+                                    "device": "bot"
+                                }
+                            }
+                        })
 
-    await message.reply(f"🛒 {qtd} {plural} com afiliado:\n\n{texto_convertido}")
+                    # Evento de mensagem
+                    elif op == 0 and t == "MESSAGE_CREATE":
+                        autor = data["d"].get("author", {})
+                        if autor.get("bot"):
+                            continue
 
-# ── Inicialização ────────────────────────────────────────────────────────────
+                        conteudo = data["d"].get("content", "")
+                        channel_id = data["d"]["channel_id"]
+
+                        texto_convertido, links = converter_links(conteudo, AFILIADO_ID)
+
+                        if links:
+                            qtd = len(links)
+                            plural = "link convertido" if qtd == 1 else "links convertidos"
+                            resposta = f"🛒 {qtd} {plural} com afiliado:\n\n{texto_convertido}"
+                            await enviar_mensagem(session, channel_id, resposta)
+
+                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    logging.warning("WebSocket desconectado, reconectando...")
+                    break
+
 async def main():
-    t = threading.Thread(target=iniciar_servidor, daemon=True)
-    t.start()
-    print(f"🌐 Servidor HTTP iniciado na porta {PORT}")
-    print("🤖 Bot Discord rodando...")
-    await client.start(TOKEN)
+    threading.Thread(target=iniciar_servidor, daemon=True).start()
+    logging.info(f"Servidor HTTP iniciado na porta {PORT}")
+    logging.info("Bot Discord iniciando...")
+
+    while True:
+        try:
+            await conectar_gateway()
+        except Exception as e:
+            logging.error(f"Erro: {e}")
+        logging.info("Reconectando em 5 segundos...")
+        await asyncio.sleep(5)
 
 if __name__ == "__main__":
     asyncio.run(main())

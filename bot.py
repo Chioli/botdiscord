@@ -5,7 +5,7 @@ import threading
 import asyncio
 from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import discord
+import nextcord as discord
 
 # ── Configurações ────────────────────────────────────────────────────────────
 TOKEN = os.environ.get("DISCORD_TOKEN")

@@ -9,7 +9,7 @@ import aiohttp
 
 # ── Configurações ────────────────────────────────────────────────────────────
 TOKEN = os.environ.get("DISCORD_TOKEN")
-AFILIADO_ID = os.environ.get("AFILIADO_ID", "chioli")
+AFILIADO_ID = os.environ.get("AFILIADO_ID", "mecanicachioli")
 ML_COOKIE = os.environ.get("ML_COOKIE", "")
 PORT = int(os.environ.get("PORT", 8080))
 
